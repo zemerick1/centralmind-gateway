@@ -18,6 +18,10 @@ class Settings(BaseSettings):
         default="python -m centralmind",
         description="Command to start the CentralMind MCP server"
     )
+    centralmind_path: Optional[str] = Field(
+        default=None,
+        description="Path to the central-mind project directory (so it can find its .env)"
+    )
     mcp_timeout: int = Field(default=60, description="Timeout for MCP calls in seconds")
 
     # LLM (via LiteLLM)
@@ -30,6 +34,7 @@ class Settings(BaseSettings):
 
     xai_api_key: Optional[str] = Field(default=None)
     google_api_key: Optional[str] = Field(default=None)
+    gemini_api_key: Optional[str] = Field(default=None)
     anthropic_api_key: Optional[str] = Field(default=None)
     openai_api_key: Optional[str] = Field(default=None)
 

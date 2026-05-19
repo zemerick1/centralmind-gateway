@@ -2,6 +2,7 @@
 CentralMind Gateway - Main FastAPI application.
 """
 
+import json
 import logging
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
@@ -48,16 +49,6 @@ class QueryRequest(BaseModel):
     context: Optional[Dict[str, Any]] = None
 
 
-class WebhookRequest(BaseModel):
-    # Generic + Aruba-specific fields
-    alert_type: Optional[str] = None
-    ap_name: Optional[str] = None
-    site: Optional[str] = None
-    client_mac: Optional[str] = None
-    message: Optional[str] = None
-    raw: Optional[Dict[str, Any]] = None   # full original payload
-
-
 async def verify_api_key(x_api_key: Optional[str] = Header(None)):
     if settings.gateway_api_key and x_api_key != settings.gateway_api_key:
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -81,40 +72,25 @@ async def query_endpoint(req: QueryRequest):
     return result
 
 
-@app.post("/webhook/aruba", dependencies=[Depends(verify_api_key)])
-async def aruba_webhook(req: WebhookRequest):
-    """Primary webhook for Aruba Central alerts."""
-    logger.info(f"Received Aruba webhook: {req.alert_type or 'unknown'}")
-
-    # Build smart prompt based on event type
-    if req.alert_type and "ap" in (req.alert_type or "").lower():
-        prompt = (
-            f"AP alert received: {req.alert_type}. "
-            f"AP: {req.ap_name or 'unknown'}, Site: {req.site or 'unknown'}. "
-            "Please investigate current status, connected clients, and recent events. "
-            "Then post a clear notification to the team."
-        )
-    else:
-        prompt = (
-            f"Network event received: {req.alert_type or req.message or 'unknown event'}. "
-            "Analyze the situation using available tools and notify the team with key details and recommended actions."
-        )
-
-    context = req.model_dump(exclude_none=True)
-
-    result = await run_agent(prompt, context=context)
-    return {
-        "status": "processed",
-        "event_type": req.alert_type,
-        "agent_result": result
-    }
-
-
 @app.post("/webhook", dependencies=[Depends(verify_api_key)])
-async def generic_webhook(payload: Dict[str, Any]):
-    """Generic webhook endpoint for any source."""
-    prompt = f"Process this incoming event and take appropriate action: {payload}"
-    result = await run_agent(prompt, context={"source": "generic_webhook", "payload": payload})
+async def webhook(payload: Dict[str, Any]):
+    """
+    Generic webhook endpoint. Accepts any JSON payload from any source.
+    The LLM enriches the event data using CentralMind tools and produces
+    an actionable summary.
+    """
+    logger.info(f"Received webhook: {json.dumps(payload, default=str)[:200]}...")
+
+    prompt = (
+        "An event was received via webhook. Analyze the payload below, "
+        "use your tools to gather additional context from Aruba Central "
+        "(e.g. device status, clients, site info), and produce a clear, "
+        "actionable summary of the situation including business impact "
+        "and recommended next steps.\n\n"
+        f"Webhook payload:\n{json.dumps(payload, indent=2, default=str)}"
+    )
+
+    result = await run_agent(prompt, context=payload)
     return {"status": "processed", "agent_result": result}
 
 

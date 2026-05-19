@@ -44,6 +44,7 @@ class CentralMindClient:
             command=command,
             args=args,
             env=None,  # Inherits current environment (so .env from central-mind works if set)
+            cwd=settings.centralmind_path,  # Run from central-mind's directory so it finds its .env
         )
 
         self._stdio_ctx = stdio_client(server_params)

@@ -1,6 +1,12 @@
 """
 Simple, observable LLM agent for CentralMind Gateway.
 Uses LiteLLM for multi-provider support + tool calling.
+
+Design: The gateway does NOT re-define MCP tools. It fetches them
+from the CentralMind MCP server at runtime, converts them to OpenAI
+function-calling format, and forwards calls back. This keeps the
+gateway thin and ensures tool descriptions stay in sync with the
+MCP server.
 """
 
 import json
@@ -10,7 +16,6 @@ from typing import Any, Dict, List, Optional
 import litellm
 from app.config import settings
 from app.tools.aruba import centralmind_client
-from app.tools.output import post_to_webhook, post_to_slack
 
 logger = logging.getLogger(__name__)
 
@@ -18,20 +23,51 @@ logger = logging.getLogger(__name__)
 litellm.set_verbose = settings.log_level.upper() == "DEBUG"
 
 
+def _resolve_api_key() -> Optional[str]:
+    """Resolve the correct API key for the configured LLM model."""
+    model = settings.llm_model.lower()
+    if "gemini" in model or "google" in model:
+        return settings.gemini_api_key or settings.google_api_key
+    elif "xai" in model or "grok" in model:
+        return settings.xai_api_key
+    elif "anthropic" in model or "claude" in model:
+        return settings.anthropic_api_key
+    elif "openai" in model or "gpt" in model:
+        return settings.openai_api_key
+    return None
+
+
+def _mcp_tool_to_openai(mcp_tool) -> dict:
+    """Convert an MCP Tool object to OpenAI function-calling format."""
+    return {
+        "type": "function",
+        "function": {
+            "name": mcp_tool.name,
+            "description": mcp_tool.description or "",
+            "parameters": mcp_tool.inputSchema,
+        }
+    }
+
+
+async def _get_mcp_tools() -> List[dict]:
+    """Fetch tool definitions from the CentralMind MCP server."""
+    if not centralmind_client.session:
+        await centralmind_client.start()
+
+    result = await centralmind_client.session.list_tools()
+    return [_mcp_tool_to_openai(t) for t in result.tools]
+
+
 SYSTEM_PROMPT = """You are a helpful, precise network operations assistant for HPE Aruba Central.
 
-You have access to powerful tools:
-- Aruba Central via CentralMind MCP (search + execute)
-- Posting to notification channels (Teams, Slack, webhooks)
+You have tools provided by the CentralMind MCP server. Use them exactly as described.
+All code you write MUST be an async arrow function that returns its result.
 
 Rules:
 1. Always be factual and cite what you queried.
 2. Default to readonly operations unless explicitly told otherwise.
-3. When posting notifications, make them clear, actionable, and include key details.
-4. If you need more data from Aruba Central, use the search/execute tools first.
-5. Keep responses concise but complete.
-
-Current context will be provided with each request.
+3. Always search for the correct endpoint first before executing.
+4. Keep responses concise but complete.
 """
 
 
@@ -42,7 +78,7 @@ async def run_agent(
 ) -> Dict[str, Any]:
     """
     Run a single-turn agent with tool calling.
-    Returns the final answer + any side effects (e.g. posts made).
+    Returns the final answer + any side effects.
     """
     context = context or {}
     messages = [
@@ -50,115 +86,75 @@ async def run_agent(
         {"role": "user", "content": f"Context: {json.dumps(context, default=str)}\n\nTask: {user_prompt}"}
     ]
 
-    # Define available tools for the LLM
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "aruba_search",
-                "description": "Search Aruba Central OpenAPI spec using JavaScript code (returns matching endpoints)",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "code": {"type": "string", "description": "JavaScript function that explores spec.paths"}
-                    },
-                    "required": ["code"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "aruba_execute",
-                "description": "Execute a live Aruba Central API call using JavaScript (respects readonly mode)",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "code": {"type": "string", "description": "JavaScript using central.request({...})"}
-                    },
-                    "required": ["code"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "post_notification",
-                "description": "Post a message to the primary output channel (Teams/Slack/webhook)",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string"},
-                        "title": {"type": "string", "description": "Optional title for Teams"}
-                    },
-                    "required": ["text"]
-                }
-            }
-        },
-    ]
+    # Fetch tools directly from the MCP server
+    tools = await _get_mcp_tools()
+    logger.info(f"Loaded {len(tools)} tools from MCP: {[t['function']['name'] for t in tools]}")
 
     try:
-        response = await litellm.acompletion(
-            model=settings.llm_model,
-            messages=messages,
-            tools=tools,
-            tool_choice="auto",
-            temperature=settings.llm_temperature,
-            max_tokens=settings.llm_max_tokens,
-        )
-
-        message = response.choices[0].message
-        tool_calls = message.tool_calls or []
-
         results = []
-        final_text = message.content or ""
+        max_iterations = 5
 
-        for tool_call in tool_calls:
-            func_name = tool_call.function.name
-            args = json.loads(tool_call.function.arguments)
+        for iteration in range(max_iterations):
+            response = await litellm.acompletion(
+                model=settings.llm_model,
+                api_key=_resolve_api_key(),
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=settings.llm_temperature,
+                max_tokens=settings.llm_max_tokens,
+            )
 
-            logger.info(f"Agent calling tool: {func_name} with args: {args}")
+            message = response.choices[0].message
+            tool_calls = message.tool_calls or []
 
-            if func_name == "aruba_search":
-                result = await centralmind_client.call_tool("search_central", {"code": args["code"]})
-            elif func_name == "aruba_execute":
-                result = await centralmind_client.call_tool("execute_central", {"code": args["code"]})
-            elif func_name == "post_notification":
-                result = await post_to_webhook({"text": args["text"]}, title=args.get("title"))
-                # Also try Slack if configured
-                if settings.slack_webhook_url:
-                    await post_to_slack(args["text"])
-            else:
-                result = {"error": f"Unknown tool {func_name}"}
+            # No tool calls = LLM is done, return final answer
+            if not tool_calls:
+                return {
+                    "final_answer": message.content or "",
+                    "tool_results": results,
+                    "model": settings.llm_model,
+                    "iterations": iteration + 1,
+                }
 
-            results.append({"tool": func_name, "result": result})
-
-            # Feed result back to LLM for final answer (optional second turn)
+            # Process tool calls and feed results back
             messages.append({
                 "role": "assistant",
-                "content": None,
-                "tool_calls": [tool_call]
-            })
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": json.dumps(result, default=str)[:4000]  # truncate if huge
+                "content": message.content,
+                "tool_calls": tool_calls,
             })
 
-        # Final LLM pass if we used tools
-        if tool_calls:
-            final_response = await litellm.acompletion(
-                model=settings.llm_model,
-                messages=messages,
-                temperature=0.1,
-                max_tokens=2000,
-            )
-            final_text = final_response.choices[0].message.content or final_text
+            for tool_call in tool_calls:
+                func_name = tool_call.function.name
+                args = json.loads(tool_call.function.arguments)
+
+                logger.info(f"Agent [{iteration+1}/{max_iterations}] calling tool: {func_name}")
+
+                result = await centralmind_client.call_tool(func_name, args)
+                results.append({"tool": func_name, "result": result})
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": json.dumps(result, default=str)[:4000]
+                })
+
+        # If we hit max iterations, do one final pass without tools to force a summary
+        logger.warning(f"Agent hit max iterations ({max_iterations}), forcing final answer")
+        response = await litellm.acompletion(
+            model=settings.llm_model,
+            api_key=_resolve_api_key(),
+            messages=messages,
+            temperature=0.1,
+            max_tokens=2000,
+        )
+        final_text = response.choices[0].message.content or ""
 
         return {
             "final_answer": final_text,
             "tool_results": results,
             "model": settings.llm_model,
+            "iterations": max_iterations,
         }
 
     except Exception as e:

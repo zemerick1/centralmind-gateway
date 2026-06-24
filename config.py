@@ -13,7 +13,7 @@ class Settings(BaseSettings):
 
     # CentralMind MCP
     centralmind_command: str = Field(
-        default="python -m centralmind",
+        default="centralmind",
         description="Command to start the CentralMind MCP server"
     )
 

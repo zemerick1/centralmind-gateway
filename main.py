@@ -1,3 +1,8 @@
+"""
+CentralMind Gateway - Refactored
+The gateway's LLM now directly uses tools exposed by centralmind.
+"""
+
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -16,191 +21,247 @@ logger = logging.getLogger(__name__)
 litellm.set_verbose = settings.log_level.upper() == "DEBUG"
 
 
+def format_tool_result(tool_name: str, result: Any) -> str:
+    """Format tool results nicely for the LLM, especially errors."""
+    if isinstance(result, dict) and "error" in result:
+        error_msg = result.get("error", "Unknown error")
+        return f"Tool '{tool_name}' failed with error: {error_msg}"
+
+    if isinstance(result, dict):
+        if result.get("status_code") in (404, 403, 401):
+            return (
+                f"Tool '{tool_name}' returned HTTP {result.get('status_code')}. "
+                f"This endpoint may not exist for this device or monitoring may not be enabled. "
+                f"Try a different related endpoint or broaden the search."
+            )
+
+    try:
+        formatted = json.dumps(result, default=str, indent=2)
+        if len(formatted) > 3500:
+            formatted = formatted[:3500] + "\n... [truncated]"
+        return formatted
+    except Exception:
+        return str(result)[:3500]
+
+
 SYSTEM_PROMPT = """You are a precise infrastructure event processor.
 
-You have access to MCP tools that let you search infrastructure API specifications and execute live API calls.
+Your job is to investigate alerts by finding **concrete, current data** about the reported issue — not just general API discovery.
 
-When you need more context, use the search and execute tools by providing appropriate JavaScript code.
+Investigation Priorities:
+- When given a device serial or name, prioritize finding recent events, alerts, or health data for that specific device.
+- Look for endpoints that can show the **current state** of the reported problem (e.g. inconsistent ports, STP status, port configuration, recent topology changes).
+- After using `search_*` tools, move quickly to `execute_*` calls on the most relevant endpoints.
+- If initial queries return limited data or errors, try related areas (events, alerts, device health, port status, recent changes).
+- Do not stop at high-level summaries. Attempt to identify the specific port/interface involved and its current settings when possible.
+- Synthesize findings into clear root cause, impact, and actionable recommendations.
 
-Be factual. Cite what you queried. Default to read-only operations.
-
-When ready, post a clear actionable notification using the post_notification tool."""
-
+Be thorough. The goal is to explain **why** the inconsistency exists based on actual data from the device/platform.
+"""
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting CentralMind Gateway...")
-    await mcp.start()
+    await mcp.discover_tools()
     yield
-    await mcp.stop()
     logger.info("Gateway shutdown complete.")
 
 
 app = FastAPI(
     title="CentralMind Gateway",
-    description="Minimal webhook event processor using CentralMind MCP",
-    version="0.2.0",
+    description="Webhook event processor using CentralMind MCP tools",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
 
-def get_mcp_tools() -> list:
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": "search",
-                "description": "Search infrastructure API specs using JavaScript code",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "code": {"type": "string", "description": "JavaScript function to explore the spec"}
-                    },
-                    "required": ["code"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "execute",
-                "description": "Execute a live infrastructure API call using JavaScript",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "code": {"type": "string", "description": "JavaScript using platform.request(...) style"}
-                    },
-                    "required": ["code"],
-                },
-            },
-        },
-    ]
+def get_llm_tools() -> list:
+    """Build LLM tool definitions from centralmind + local tools."""
+    tools = []
 
-
-def get_output_tools() -> list:
-    return [
-        {
+    # Add all tools discovered from centralmind
+    for tool_name, tool_def in mcp._available_tools.items():
+        tools.append({
             "type": "function",
             "function": {
-                "name": "post_notification",
-                "description": "Post a notification (logs by default, posts externally if configured)",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string"},
-                        "title": {"type": "string"},
+                "name": tool_name,
+                "description": tool_def.description or f"Tool: {tool_name}",
+                "parameters": tool_def.inputSchema or {"type": "object", "properties": {}},
+            }
+        })
+
+    # Add structured post_notification tool (some fields optional)
+    tools.append({
+        "type": "function",
+        "function": {
+            "name": "post_notification",
+            "description": "Post a structured notification after completing investigation",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Short, clear title for the alert"
                     },
-                    "required": ["text"],
+                    "summary": {
+                        "type": "string",
+                        "description": "One-sentence summary of the issue"
+                    },
+                    "investigation_summary": {
+                        "type": "string",
+                        "description": "Key findings from the investigation"
+                    },
+                    "root_cause": {
+                        "type": "string",
+                        "description": "Likely root cause based on the data gathered (best effort is acceptable)"
+                    },
+                    "impact": {
+                        "type": "string",
+                        "description": "Impact assessment (e.g. Low / Medium / High, client impact)"
+                    },
+                    "recommended_actions": {
+                        "type": "string",
+                        "description": "Clear, actionable next steps"
+                    },
+                    "severity": {
+                        "type": "string",
+                        "enum": ["Low", "Medium", "High", "Critical"],
+                        "description": "Severity level of the issue"
+                    }
                 },
+                "required": ["title", "summary", "investigation_summary"]
             },
         }
-    ]
+    })
+
+    return tools
 
 
-async def post_to_webhook(text: str, title: str | None = None):
+async def post_to_webhook(text: str, title: str | None = None) -> Dict[str, Any]:
     if not settings.output_webhook_url:
-        return {"status": "skipped"}
+        return {"status": "logged", "reason": "no output_webhook_url configured"}
+
     payload = {"text": text}
     if title:
         payload["title"] = title
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(settings.output_webhook_url, json=payload)
-        return {"status": "success", "status_code": resp.status_code}
-
-
-async def post_to_slack(text: str):
-    if not settings.slack_webhook_url:
-        return {"status": "skipped"}
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(settings.slack_webhook_url, json={"text": text})
-        return {"status": "success"}
-
-
-async def run_event_processor(context: Dict[str, Any]):
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Event context:\n{json.dumps(context, default=str)}"},
-    ]
-
-    tools = get_mcp_tools() + get_output_tools()
 
     try:
-        response = await litellm.acompletion(
-            model=settings.llm_model,
-            messages=messages,
-            tools=tools,
-            tool_choice="auto",
-            temperature=settings.llm_temperature,
-            max_tokens=settings.llm_max_tokens,
-        )
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(settings.output_webhook_url, json=payload)
+            return {"status": "success", "status_code": resp.status_code}
+    except Exception as e:
+        logger.error(f"Failed to post to webhook: {e}")
+        return {"status": "failed", "error": str(e)}
 
-        message = response.choices[0].message
-        tool_calls = message.tool_calls or []
 
-        results = []
-        final_text = message.content or ""
+async def run_event_processor(context: Dict[str, Any]) -> Dict[str, Any]:
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"Incoming event:\n{json.dumps(context, default=str, indent=2)}"},
+    ]
 
-        for tool_call in tool_calls:
-            func_name = tool_call.function.name
-            args = json.loads(tool_call.function.arguments or "{}")
+    tools = get_llm_tools()
+    max_iterations = 15
+    iteration = 0
+    final_text = ""
 
-            if func_name == "search":
-                result = await mcp.call_search(args.get("code", ""))
-            elif func_name == "execute":
-                result = await mcp.call_execute(args.get("code", ""))
-            elif func_name == "post_notification":
-                text = args.get("text", "")
-                title = args.get("title")
+    while iteration < max_iterations:
+        iteration += 1
 
-                # Default: log the output
-                logger.info("=== LLM Output ===")
-                if title:
-                    logger.info(f"Title: {title}")
-                logger.info(text)
-                logger.info("==================")
-
-                result = {"status": "logged"}
-
-                if settings.output_webhook_url:
-                    result["webhook"] = await post_to_webhook(text, title)
-                if settings.slack_webhook_url:
-                    result["slack"] = await post_to_slack(text)
-
-            else:
-                result = {"error": f"Unknown tool {func_name}"}
-
-            results.append({"tool": func_name, "result": result})
-
-        if tool_calls:
-            messages.append({"role": "assistant", "content": None, "tool_calls": tool_calls})
-            for r in results:
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": json.dumps(r["result"], default=str)[:3000]
-                })
-
-            final_response = await litellm.acompletion(
+        try:
+            response = await litellm.acompletion(
                 model=settings.llm_model,
                 messages=messages,
-                temperature=0.1,
-                max_tokens=1500,
+                tools=tools,
+                tool_choice="auto",
+                temperature=settings.llm_temperature,
+                max_tokens=settings.llm_max_tokens,
             )
-            final_text = final_response.choices[0].message.content or final_text
 
-        return {
-            "final_answer": final_text,
-            "tool_results": results,
-        }
+            message = response.choices[0].message
+            tool_calls = message.tool_calls or []
 
-    except Exception as e:
-        logger.exception("Processing failed")
-        return {"error": str(e)}
+            if not tool_calls:
+                final_text = message.content or ""
+                break
+
+            messages.append({
+                "role": "assistant",
+                "content": message.content,
+                "tool_calls": tool_calls
+            })
+
+            for tool_call in tool_calls:
+                func_name = tool_call.function.name
+                args = json.loads(tool_call.function.arguments or "{}")
+
+                logger.info(f"[Iteration {iteration}] Tool called: {func_name}")
+
+                if func_name == "post_notification":
+                    title = args.get("title", "Infrastructure Alert")
+                    summary = args.get("summary", "")
+                    investigation = args.get("investigation_summary", "")
+                    root_cause = args.get("root_cause", "")
+                    impact = args.get("impact", "")
+                    actions = args.get("recommended_actions", "")
+                    severity = args.get("severity", "Medium")
+
+                    notification_text = f"""**{title}** (Severity: {severity})
+
+**Summary**: {summary}
+
+**Investigation**:
+{investigation}
+
+**Root Cause**: {root_cause}
+
+**Impact**: {impact}
+
+**Recommended Actions**:
+{actions}
+"""
+                    result = await post_to_webhook(notification_text, title)
+                    logger.info(f"=== LLM Output ===\n{notification_text}\n==================")
+
+                    return {
+                        "final_answer": notification_text,
+                        "iterations_used": iteration,
+                    }
+
+                else:
+                    result = await mcp.call_tool(func_name, args)
+                    formatted_result = format_tool_result(func_name, result)
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": formatted_result
+                    })
+
+        except Exception as e:
+            logger.exception(f"Error during iteration {iteration}")
+            return {"error": str(e)}
+
+    if iteration >= max_iterations:
+        logger.warning("Reached maximum tool calling iterations")
+        if not final_text:
+            final_text = "Investigation stopped after reaching maximum steps."
+
+    return {
+        "final_answer": final_text,
+        "iterations_used": iteration,
+    }
 
 
 @app.post("/webhook")
 async def webhook(payload: Dict[str, Any]):
-    context = {"source": "webhook", "payload": payload}
+    logger.info("Received webhook event")
+
+    context = {
+        "source": "webhook",
+        "payload": payload,
+    }
+
     result = await run_event_processor(context)
     return {"status": "processed", "result": result}
 
@@ -209,9 +270,8 @@ async def webhook(payload: Dict[str, Any]):
 async def health():
     return {
         "status": "healthy",
-        "mcp_connected": bool(mcp.session),
-        "search_tools": mcp.search_tools,
-        "execute_tools": mcp.execute_tools,
+        "discovered_tools": list(mcp._available_tools.keys()),
+        "llm_model": settings.llm_model,
     }
 
 

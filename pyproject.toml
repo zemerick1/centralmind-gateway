@@ -1,34 +1,36 @@
 [project]
 name = "centralmind-gateway"
-version = "0.1.0"
-description = "LLM-powered event gateway for Aruba Central using CentralMind MCP server"
+version = "0.2.0"
+description = "Minimal LLM-powered webhook event gateway using CentralMind MCP"
 readme = "README.md"
 requires-python = ">=3.12"
+
+# Core dependencies
+# Note: We do not use a package layout, so this is treated as an application
+# Run with: uv sync && uv run uvicorn main:app --reload
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
     "pydantic-settings>=2.5.0",
     "httpx>=0.27.0",
     "litellm>=1.52.0",
-    "mcp>=1.0.0",           # Official MCP Python SDK
+    "mcp>=1.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "ruff",
-    "pytest",
-    "pytest-asyncio",
+    "ruff>=0.6.0",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
 ]
 
 [tool.uv]
-dev-dependencies = [
-    "ruff>=0.6.0",
-]
+# Use uv sync to create .venv and install dependencies
+default-groups = ["dev"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+# We intentionally do not define a build-system here because this is
+# an application, not a distributable package. Use `uv sync` + `uv run`.

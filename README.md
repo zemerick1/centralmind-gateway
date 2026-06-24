@@ -1,68 +1,66 @@
 # CentralMind Gateway
 
-Minimal, generic webhook event processor using your **central-mind** MCP server.
+Minimal, generic webhook event processor powered by your **central-mind** MCP server.
 
 ## Philosophy
 
 - Webhook-only
-- Fully generic
-- Dynamic tool discovery
-- Extremely small (3 core files)
-- Logging is the default output behavior
+- Fully generic core
+- Dynamic MCP tool discovery
+- Extremely small codebase
+- Logging is the default output
 
 ## Project Structure
 
-```
+```text
 centralmind-gateway/
 ├── config.py
 ├── main.py
 ├── mcp_client.py
-├── README.md
 ├── pyproject.toml
+├── README.md
 ├── Dockerfile
 └── docker-compose.yml
 ```
 
-## Quick Start
+## Quick Start (uv recommended)
 
 ```bash
 git clone https://github.com/zemerick1/centralmind-gateway.git
 cd centralmind-gateway
 
-# Create environment
-uv venv
-source .venv/bin/activate
+# Create virtual environment and install dependencies
+uv sync
 
-# Install dependencies (no need to install the package itself)
-uv pip install -r pyproject.toml --extra dev   # or just the main deps
-
-# Or simply:
-uv pip install fastapi uvicorn pydantic-settings httpx litellm mcp
-```
-
-### Run the gateway
-
-**Recommended way (no installation needed):**
-
-```bash
+# Run the gateway
 uv run uvicorn main:app --reload
 ```
 
-Or:
+### Alternative (without uv sync)
 
 ```bash
-python -m uvicorn main:app --reload
+uv venv
+source .venv/bin/activate
+uv pip install -r pyproject.toml
+uv run uvicorn main:app --reload
 ```
 
-## Test
+## Test It
+
+Send a sample webhook:
 
 ```bash
 curl -X POST http://localhost:8000/webhook \
   -H "Content-Type: application/json" \
-  -d '{"alert_type": "test", "message": "Test event"}'
+  -d '{
+    "alert_type": "ap_down",
+    "ap_name": "AP-01",
+    "site": "HQ",
+    "message": "Access Point is down"
+  }'
 ```
 
-Check the logs — the LLM output will be printed.
+The LLM output will be logged to the console by default.
 
 ## Health Check
 
@@ -72,20 +70,27 @@ curl http://localhost:8000/health
 
 ## Configuration
 
-Create a `.env` file:
+Create a `.env` file in the root:
 
 ```env
 CENTRALMIND_COMMAND=python -m centralmind
 
 LLM_MODEL=xai/grok-3-latest
-XAI_API_KEY=your_key_here
+XAI_API_KEY=sk-...
 
-# Optional
-OUTPUT_WEBHOOK_URL=...
-SLACK_WEBHOOK_URL=...
+# Optional external outputs
+OUTPUT_WEBHOOK_URL=https://...
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
+```
+
+## Running with Docker
+
+```bash
+docker compose up --build
 ```
 
 ## Notes
 
-- You do **not** need to run `pip install -e .`. This project is intentionally structured as a small application, not a distributable package.
-- Logging is the default. External webhooks/Slack are optional.
+- This is an **application**, not a library. Do not use `pip install -e .`.
+- Use `uv sync` + `uv run` for the best experience.
+- The gateway discovers available MCP tools (`search_*`, `execute_*`) dynamically at startup.

@@ -1,15 +1,53 @@
-version: "3.9"
+version: '3.8'
 
 services:
-  gateway:
-    build: .
-    ports:
-      - "8000:8000"
-    env_file:
-      - .env
-    volumes:
-      # Mount your central-mind if you want to run it from source inside the container
-      # - ../central-mind:/central-mind:ro
+  centralmind:
+    build:
+      context: ../central-mind
+      dockerfile: Dockerfile
+    container_name: centralmind
     restart: unless-stopped
-    # If running central-mind inside the same container, add:
-    # command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      - LOG_LEVEL=INFO
+    volumes:
+      - centralmind_data:/app/data
+    networks:
+      - centralmind-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 8000), timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: centralmind-gateway
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      - CENTRALMIND_COMMAND=centralmind
+      - LLM_MODEL=xai/grok-4.3
+      - LOG_LEVEL=INFO
+      # Add your LLM API key here or via .env file
+      # - XAI_API_KEY=your_key_here
+    depends_on:
+      centralmind:
+        condition: service_healthy
+    networks:
+      - centralmind-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  centralmind_data:
+
+networks:
+  centralmind-net:
+    driver: bridge

@@ -37,6 +37,49 @@ The gateway itself is intentionally thin. Most of the domain intelligence lives 
 - Designed to be easy to run with Docker Compose
 - Extensible through the `centralmind` MCP server
 
+## Prerequisites
+
+Before following the Getting Started guide, make sure you have Docker and Docker Compose installed.
+
+### Install Docker + Docker Compose (Ubuntu / Debian)
+
+Run these commands:
+
+```bash
+# Update package index
+sudo apt update
+
+# Install required packages
+sudo apt install ca-certificates curl gnupg -y
+
+# Add Docker's official GPG key
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+# Add the Docker repository
+
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+# Install Docker Engine + Compose plugin
+sudo apt update
+sudo apt install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y
+```
+
+Verify installation:
+
+```bash
+docker --version
+docker compose version
+```
+
+> **Note:** If you're not on Ubuntu/Debian, see the [official Docker installation docs](https://docs.docker.com/engine/install/).
+
+---
+
 ## Getting Started (Recommended)
 
 ### Docker Compose (Preferred for Most Users)
@@ -187,4 +230,3 @@ Contributions are welcome. Please open an issue or pull request if you have impr
 ## License
 
 MIT License
-```
